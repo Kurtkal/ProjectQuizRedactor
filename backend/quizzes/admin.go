@@ -2,8 +2,6 @@ package quizzes
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -11,7 +9,10 @@ import (
 	"quizsystem/internal/current"
 	"quizsystem/internal/store"
 
-	"encore.dev/storage/sqldb"
+	ent "quizsystem/internal/store/ent"
+	entanswers "quizsystem/internal/store/ent/answers"
+	entquestions "quizsystem/internal/store/ent/questions"
+	entquiz "quizsystem/internal/store/ent/quiz"
 )
 
 type DeleteResponse struct {
@@ -24,59 +25,38 @@ func ListAdminQuizzes(ctx context.Context) (*QuizListResponse, error) {
 		return nil, err
 	}
 
-	rows, err := store.DB.Query(ctx, `
-		SELECT
-			q.id,
-			q.title,
-			q.is_published,
-			q.pass_threshold,
-			q.one_attempt,
-			q.show_answers,
-			COUNT(questions.id),
-			q.created_at,
-			u.id,
-			u.email
-		FROM quizzes q
-		JOIN users u ON u.id = q.created_by
-		LEFT JOIN questions ON questions.quiz_id = q.id
-		GROUP BY q.id, u.id, u.email
-		ORDER BY q.created_at DESC
-	`)
+	quizList, err := store.EntClient.Quiz.
+		Query().
+		WithCreator().
+		WithQuestions().
+		Order(entquiz.ByCreatedAt()).
+		All(ctx)
 	if err != nil {
 		return nil, apierr.Internal("could not list quizzes", err)
 	}
-	defer rows.Close()
 
 	quizzes := make([]QuizSummary, 0)
-	for rows.Next() {
-		var quiz QuizSummary
-		var threshold sql.NullInt64
-		var questionCount int64
-		var creator AdminUser
-		if err := rows.Scan(
-			&quiz.ID,
-			&quiz.Title,
-			&quiz.IsPublished,
-			&threshold,
-			&quiz.OneAttempt,
-			&quiz.ShowAnswers,
-			&questionCount,
-			&quiz.CreatedAt,
-			&creator.ID,
-			&creator.Email,
-		); err != nil {
-			return nil, apierr.Internal("could not read quiz", err)
+	for _, q := range quizList {
+		summary := QuizSummary{
+			ID:            int64(q.ID),
+			Title:         q.Title,
+			IsPublished:   q.IsPublished,
+			QuestionCount: len(q.Edges.Questions),
+			OneAttempt:    q.OneAttempt,
+			ShowAnswers:   q.ShowAnswers,
+			CreatedAt:     q.CreatedAt,
 		}
-		if threshold.Valid {
-			value := int(threshold.Int64)
-			quiz.PassThreshold = &value
+		if q.PassThreshold != nil {
+			v := *q.PassThreshold
+			summary.PassThreshold = &v
 		}
-		quiz.QuestionCount = int(questionCount)
-		quiz.CreatedBy = &creator
-		quizzes = append(quizzes, quiz)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, apierr.Internal("could not read quizzes", err)
+		if q.Edges.Creator != nil {
+			summary.CreatedBy = &AdminUser{
+				ID:    int64(q.Edges.Creator.ID),
+				Email: q.Edges.Creator.Email,
+			}
+		}
+		quizzes = append(quizzes, summary)
 	}
 
 	return &QuizListResponse{Quizzes: quizzes}, nil
@@ -93,7 +73,7 @@ func CreateQuiz(ctx context.Context, req *UpsertQuizRequest) (*AdminQuizDetail, 
 		return nil, err
 	}
 
-	tx, err := store.DB.Begin(ctx)
+	tx, err := store.EntClient.Tx(ctx)
 	if err != nil {
 		return nil, apierr.Internal("could not start transaction", err)
 	}
@@ -104,17 +84,21 @@ func CreateQuiz(ctx context.Context, req *UpsertQuizRequest) (*AdminQuizDetail, 
 		}
 	}()
 
-	var quizID int64
-	err = tx.QueryRow(ctx, `
-		INSERT INTO quizzes (title, is_published, pass_threshold, one_attempt, show_answers, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id
-	`, strings.TrimSpace(req.Title), req.IsPublished, thresholdValue(req.PassThreshold), req.OneAttempt, req.ShowAnswers, admin.ID).Scan(&quizID)
+	qCreate := tx.Quiz.Create().
+		SetTitle(strings.TrimSpace(req.Title)).
+		SetIsPublished(req.IsPublished).
+		SetOneAttempt(req.OneAttempt).
+		SetShowAnswers(req.ShowAnswers).
+		SetCreatorID(int(admin.ID))
+	if req.PassThreshold != nil {
+		qCreate = qCreate.SetPassThreshold(*req.PassThreshold)
+	}
+	q, err := qCreate.Save(ctx)
 	if err != nil {
 		return nil, apierr.Internal("could not create quiz", err)
 	}
 
-	if err := insertQuestions(ctx, tx, quizID, req.Questions); err != nil {
+	if err := insertQuestionsEnt(ctx, tx, q.ID, req.Questions); err != nil {
 		return nil, err
 	}
 
@@ -123,7 +107,7 @@ func CreateQuiz(ctx context.Context, req *UpsertQuizRequest) (*AdminQuizDetail, 
 	}
 	committed = true
 
-	return loadAdminQuiz(ctx, quizID)
+	return loadAdminQuiz(ctx, int64(q.ID))
 }
 
 //encore:api auth method=GET path=/admin/quizzes/:id
@@ -143,7 +127,7 @@ func UpdateQuiz(ctx context.Context, id int64, req *UpsertQuizRequest) (*AdminQu
 		return nil, err
 	}
 
-	tx, err := store.DB.Begin(ctx)
+	tx, err := store.EntClient.Tx(ctx)
 	if err != nil {
 		return nil, apierr.Internal("could not start transaction", err)
 	}
@@ -154,26 +138,33 @@ func UpdateQuiz(ctx context.Context, id int64, req *UpsertQuizRequest) (*AdminQu
 		}
 	}()
 
-	res, err := tx.Exec(ctx, `
-		UPDATE quizzes
-		SET title = $2,
-		    is_published = $3,
-		    pass_threshold = $4,
-		    one_attempt = $5,
-		    show_answers = $6
-		WHERE id = $1
-	`, id, strings.TrimSpace(req.Title), req.IsPublished, thresholdValue(req.PassThreshold), req.OneAttempt, req.ShowAnswers)
+	uUpdate := tx.Quiz.UpdateOneID(int(id)).
+		SetTitle(strings.TrimSpace(req.Title)).
+		SetIsPublished(req.IsPublished).
+		SetOneAttempt(req.OneAttempt).
+		SetShowAnswers(req.ShowAnswers)
+	if req.PassThreshold != nil {
+		uUpdate = uUpdate.SetPassThreshold(*req.PassThreshold)
+	} else {
+		uUpdate = uUpdate.ClearPassThreshold()
+	}
+	_, err = uUpdate.Save(ctx)
 	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, apierr.NotFound("quiz not found")
+		}
 		return nil, apierr.Internal("could not update quiz", err)
 	}
-	if res.RowsAffected() == 0 {
-		return nil, apierr.NotFound("quiz not found")
-	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM questions WHERE quiz_id = $1`, id); err != nil {
+	// Delete old questions then reinsert
+	_, err = tx.Questions.Delete().
+		Where(entquestions.HasQuizWith(entquiz.IDEQ(int(id)))).
+		Exec(ctx)
+	if err != nil {
 		return nil, apierr.Internal("could not replace questions", err)
 	}
-	if err := insertQuestions(ctx, tx, id, req.Questions); err != nil {
+
+	if err := insertQuestionsEnt(ctx, tx, int(id), req.Questions); err != nil {
 		return nil, err
 	}
 
@@ -191,12 +182,12 @@ func DeleteQuiz(ctx context.Context, id int64) (*DeleteResponse, error) {
 		return nil, err
 	}
 
-	res, err := store.DB.Exec(ctx, `DELETE FROM quizzes WHERE id = $1`, id)
+	err := store.EntClient.Quiz.DeleteOneID(int(id)).Exec(ctx)
 	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, apierr.NotFound("quiz not found")
+		}
 		return nil, apierr.Internal("could not delete quiz", err)
-	}
-	if res.RowsAffected() == 0 {
-		return nil, apierr.NotFound("quiz not found")
 	}
 	return &DeleteResponse{Deleted: true}, nil
 }
@@ -207,38 +198,37 @@ func PublishQuiz(ctx context.Context, id int64, req *PublishRequest) (*AdminQuiz
 		return nil, err
 	}
 
-	res, err := store.DB.Exec(ctx, `
-		UPDATE quizzes
-		SET is_published = $2
-		WHERE id = $1
-	`, id, req.IsPublished)
+	_, err := store.EntClient.Quiz.UpdateOneID(int(id)).
+		SetIsPublished(req.IsPublished).
+		Save(ctx)
 	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, apierr.NotFound("quiz not found")
+		}
 		return nil, apierr.Internal("could not change publish status", err)
-	}
-	if res.RowsAffected() == 0 {
-		return nil, apierr.NotFound("quiz not found")
 	}
 
 	return loadAdminQuiz(ctx, id)
 }
 
-func insertQuestions(ctx context.Context, tx *sqldb.Tx, quizID int64, questions []QuestionInput) error {
-	for questionIndex, question := range questions {
-		var questionID int64
-		err := tx.QueryRow(ctx, `
-			INSERT INTO questions (quiz_id, text, order_index)
-			VALUES ($1, $2, $3)
-			RETURNING id
-		`, quizID, strings.TrimSpace(question.Text), questionIndex).Scan(&questionID)
+func insertQuestionsEnt(ctx context.Context, tx *ent.Tx, quizID int, questions []QuestionInput) error {
+	for i, question := range questions {
+		q, err := tx.Questions.Create().
+			SetText(strings.TrimSpace(question.Text)).
+			SetOrderIndex(i).
+			SetQuizID(quizID).
+			Save(ctx)
 		if err != nil {
 			return apierr.Internal("could not create question", err)
 		}
 
-		for answerIndex, answer := range question.Answers {
-			_, err := tx.Exec(ctx, `
-				INSERT INTO answers (question_id, text, is_correct, order_index)
-				VALUES ($1, $2, $3, $4)
-			`, questionID, strings.TrimSpace(answer.Text), answer.IsCorrect, answerIndex)
+		for j, answer := range question.Answers {
+			_, err := tx.Answers.Create().
+				SetText(strings.TrimSpace(answer.Text)).
+				SetIsCorrect(answer.IsCorrect).
+				SetOrderIndex(j).
+				SetQuestionID(q.ID).
+				Save(ctx)
 			if err != nil {
 				return apierr.Internal("could not create answer", err)
 			}
@@ -248,91 +238,58 @@ func insertQuestions(ctx context.Context, tx *sqldb.Tx, quizID int64, questions 
 }
 
 func loadAdminQuiz(ctx context.Context, id int64) (*AdminQuizDetail, error) {
-	var quiz AdminQuizDetail
-	var threshold sql.NullInt64
-	err := store.DB.QueryRow(ctx, `
-		SELECT
-			q.id,
-			q.title,
-			q.is_published,
-			q.pass_threshold,
-			q.one_attempt,
-			q.show_answers,
-			q.created_at,
-			u.id,
-			u.email
-		FROM quizzes q
-		JOIN users u ON u.id = q.created_by
-		WHERE q.id = $1
-	`, id).Scan(
-		&quiz.ID,
-		&quiz.Title,
-		&quiz.IsPublished,
-		&threshold,
-		&quiz.OneAttempt,
-		&quiz.ShowAnswers,
-		&quiz.CreatedAt,
-		&quiz.CreatedBy.ID,
-		&quiz.CreatedBy.Email,
-	)
+	q, err := store.EntClient.Quiz.
+		Query().
+		Where(entquiz.IDEQ(int(id))).
+		WithCreator().
+		WithQuestions(func(qq *ent.QuestionsQuery) {
+			qq.Order(entquestions.ByOrderIndex()).
+				WithAnswers(func(aq *ent.AnswersQuery) {
+					aq.Order(entanswers.ByOrderIndex())
+				})
+		}).
+		Only(ctx)
 	if err != nil {
-		if errors.Is(err, sqldb.ErrNoRows) {
+		if ent.IsNotFound(err) {
 			return nil, apierr.NotFound("quiz not found")
 		}
 		return nil, apierr.Internal("could not load quiz", err)
 	}
-	if threshold.Valid {
-		value := int(threshold.Int64)
-		quiz.PassThreshold = &value
+
+	quiz := AdminQuizDetail{
+		ID:          int64(q.ID),
+		Title:       q.Title,
+		IsPublished: q.IsPublished,
+		OneAttempt:  q.OneAttempt,
+		ShowAnswers: q.ShowAnswers,
+		CreatedAt:   q.CreatedAt,
+		CreatedBy: AdminUser{
+			ID:    int64(q.Edges.Creator.ID),
+			Email: q.Edges.Creator.Email,
+		},
+	}
+	if q.PassThreshold != nil {
+		v := *q.PassThreshold
+		quiz.PassThreshold = &v
 	}
 
-	rows, err := store.DB.Query(ctx, `
-		SELECT
-			questions.id,
-			questions.text,
-			questions.order_index,
-			answers.id,
-			answers.text,
-			answers.is_correct,
-			answers.order_index
-		FROM questions
-		JOIN answers ON answers.question_id = questions.id
-		WHERE questions.quiz_id = $1
-		ORDER BY questions.order_index, answers.order_index
-	`, id)
-	if err != nil {
-		return nil, apierr.Internal("could not load questions", err)
-	}
-	defer rows.Close()
-
-	questionIndex := map[int64]int{}
 	quiz.Questions = make([]AdminQuestion, 0)
-	for rows.Next() {
-		var question AdminQuestion
-		var answer AdminAnswer
-		if err := rows.Scan(
-			&question.ID,
-			&question.Text,
-			&question.Order,
-			&answer.ID,
-			&answer.Text,
-			&answer.IsCorrect,
-			&answer.Order,
-		); err != nil {
-			return nil, apierr.Internal("could not read question", err)
+	for _, question := range q.Edges.Questions {
+		aq := AdminQuestion{
+			ID:      int64(question.ID),
+			Text:    question.Text,
+			Order:   question.OrderIndex,
+			Answers: make([]AdminAnswer, 0),
 		}
-
-		index, ok := questionIndex[question.ID]
-		if !ok {
-			question.Answers = make([]AdminAnswer, 0)
-			quiz.Questions = append(quiz.Questions, question)
-			index = len(quiz.Questions) - 1
-			questionIndex[question.ID] = index
+		for _, answer := range question.Edges.Answers {
+			aq.Answers = append(aq.Answers, AdminAnswer{
+				ID:        int64(answer.ID),
+				Text:      answer.Text,
+				IsCorrect: answer.IsCorrect,
+				Order:     answer.OrderIndex,
+			})
 		}
-		quiz.Questions[index].Answers = append(quiz.Questions[index].Answers, answer)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, apierr.Internal("could not read questions", err)
+		quiz.Questions = append(quiz.Questions, aq)
 	}
 
 	quiz.QuestionCount = len(quiz.Questions)

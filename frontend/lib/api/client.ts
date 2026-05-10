@@ -11,7 +11,18 @@ import type {
   UpsertQuizPayload,
 } from "@/lib/api/types";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
+import Client, { Local } from "../../infrastructure/client";
+
+const client = new Client(Local, {
+    auth: () => {
+        // Достаем токен из твоей функции readSession
+        const session = readSession(); 
+        return { token: session?.token || "" };
+    }
+});
+
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL;
 
 type RequestOptions = Omit<RequestInit, "body" | "headers"> & {
   body?: unknown;
@@ -91,25 +102,22 @@ function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
 
 export const api = {
   register: (payload: RegisterPayload) =>
-    apiRequest<AuthResponse>("/auth/register", { method: "POST", body: payload, token: null }),
+    client.auth.register(payload),
   login: (payload: LoginPayload) =>
-    apiRequest<AuthResponse>("/auth/login", { method: "POST", body: payload, token: null }),
-  listAdminQuizzes: () => apiRequest<QuizListResponse>("/admin/quizzes"),
+    client.auth.login(payload),
+  listAdminQuizzes: () => client.admin.listQuizzes(),
   createAdminQuiz: (payload: UpsertQuizPayload) =>
-    apiRequest<AdminQuizDetail>("/admin/quizzes", { method: "POST", body: payload }),
-  getAdminQuiz: (id: number) => apiRequest<AdminQuizDetail>(`/admin/quizzes/${id}`),
+   client.admin.createQuiz(payload),
+  getAdminQuiz: (id: number) => client.admin.getQuiz(id),
   updateAdminQuiz: (id: number, payload: UpsertQuizPayload) =>
-    apiRequest<AdminQuizDetail>(`/admin/quizzes/${id}`, { method: "PUT", body: payload }),
+    client.admin.updateQuiz(id, payload),
   deleteAdminQuiz: (id: number) =>
-    apiRequest<{ deleted: boolean }>(`/admin/quizzes/${id}`, { method: "DELETE" }),
+    client.admin.deleteQuiz(id),
   publishAdminQuiz: (id: number, isPublished: boolean) =>
-    apiRequest<AdminQuizDetail>(`/admin/quizzes/${id}/publish`, {
-      method: "PATCH",
-      body: { is_published: isPublished },
-    }),
-  listQuizzes: () => apiRequest<QuizListResponse>("/quizzes"),
-  getQuiz: (id: number) => apiRequest<PublicQuizDetail>(`/quizzes/${id}`),
+    client.admin.publishQuiz(id, isPublished),
+  listQuizzes: () => client.quiz.listQuizzes(),
+  getQuiz: (id: number) => client.quiz.getQuiz(id),
   submitQuiz: (id: number, payload: SubmitQuizPayload) =>
-    apiRequest<QuizResult>(`/quizzes/${id}/submit`, { method: "POST", body: payload }),
-  getQuizResult: (id: number) => apiRequest<QuizResult>(`/quizzes/${id}/result`),
+    client.quiz.submit(id, payload),
+  getQuizResult: (id: number) => client.quiz.getResult(id),
 };
